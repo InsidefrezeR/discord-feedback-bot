@@ -38,6 +38,12 @@ async def setupfeedback(ctx):
         await ctx.send("❌ Non hai i permessi per usare questo comando. Serve il ruolo **Feedback**.")
         return
 
+    # 🔍 Controlla se esiste già un messaggio con bottoni nel canale
+    async for msg in ctx.channel.history(limit=20):
+        if msg.author == bot.user and msg.components:
+            await ctx.send("⚠️ Il bottone per il feedback è già stato inviato in questo canale.")
+            return
+
     button = Button(label="📝 Lascia il tuo Feedback", style=discord.ButtonStyle.primary, custom_id="feedback_button")
 
     async def button_callback(interaction: discord.Interaction):
@@ -108,3 +114,4 @@ async def on_message(message):
 # ===== AVVIO BOT =====
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
+
