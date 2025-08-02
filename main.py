@@ -1,6 +1,11 @@
 from flask import Flask
 from threading import Thread
+import os
+import discord
+from discord.ext import commands
+from discord.ui import Button, View
 
+# ===== KEEP ALIVE FLASK APP =====
 app = Flask('')
 
 @app.route('/')
@@ -14,17 +19,12 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-import discord
-from discord.ext import commands
-from discord.ui import Button, View
-
-# ✅ ID del canale pubblico dove pubblicare i feedback
+# ===== CONFIG =====
 FEEDBACK_CHANNEL_ID = 1401005055783735442
-# ✅ ID del canale privato per i log
 LOG_CHANNEL_ID = 1401163197767221370
-# ✅ NOME del ruolo autorizzato a usare il comando
 AUTHORIZED_ROLE = "Feedback"
 
+# ===== BOT SETUP =====
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -34,19 +34,13 @@ async def on_ready():
 
 @bot.command()
 async def setupfeedback(ctx):
-    has_permission = False
-    for role in ctx.author.roles:
-        if role.name == AUTHORIZED_ROLE:
-            has_permission = True
-            break
-
-    if not has_permission:
+    if not any(role.name == AUTHORIZED_ROLE for role in ctx.author.roles):
         await ctx.send("❌ Non hai i permessi per usare questo comando. Serve il ruolo **Feedback**.")
         return
 
-    button = Button(label="📝 Lascia il tuo Feedback", style=discord.ButtonStyle.primary)
+    button = Button(label="📝 Lascia il tuo Feedback", style=discord.ButtonStyle.primary, custom_id="feedback_button")
 
-    async def button_callback(interaction):
+    async def button_callback(interaction: discord.Interaction):
         try:
             await interaction.user.send(
                 "**📋 Compila il feedback coaching rispondendo a queste domande:**\n\n"
@@ -75,7 +69,7 @@ async def setupfeedback(ctx):
                 "🔁 Scrivi tutto in un unico messaggio. Puoi inviare immagini subito dopo."
             )
             await interaction.response.send_message("📨 Ti ho mandato il modulo in DM!", ephemeral=True)
-        except:
+        except discord.Forbidden:
             await interaction.response.send_message("❌ Non riesco a mandarti un DM. Attiva i messaggi privati!", ephemeral=True)
 
     button.callback = button_callback
@@ -88,6 +82,8 @@ async def setupfeedback(ctx):
 async def on_message(message):
     if isinstance(message.channel, discord.DMChannel) and not message.author.bot:
         feedback_channel = bot.get_channel(FEEDBACK_CHANNEL_ID)
+        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+
         if feedback_channel:
             embed = discord.Embed(
                 title=f"📝 Feedback da {message.author.name}",
@@ -96,15 +92,9 @@ async def on_message(message):
             )
             embed.set_footer(text="Coaching Feedback Bot")
 
-            files = []
-            for attachment in message.attachments:
-                file = await attachment.to_file()
-                files.append(file)
-
+            files = [await attachment.to_file() for attachment in message.attachments]
             await feedback_channel.send(embed=embed, files=files)
 
-            # ✅ LOG IN CANALE PRIVATO
-            log_channel = bot.get_channel(LOG_CHANNEL_ID)
             if log_channel:
                 log_msg = (
                     f"📥 **Nuovo feedback ricevuto**\n"
@@ -115,7 +105,6 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# 🔐 TOKEN DEL BOT
+# ===== AVVIO BOT =====
 keep_alive()
-import os
 bot.run(os.getenv("DISCORD_TOKEN"))
