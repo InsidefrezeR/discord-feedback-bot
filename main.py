@@ -19,9 +19,17 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-# ===== CONFIG =====
-FEEDBACK_CHANNEL_ID = 1401005055783735442
-LOG_CHANNEL_ID = 1401163197767221370
+# ===== CONFIG MULTI-SERVER =====
+FEEDBACK_CHANNELS = {
+    1310417606607634432: 1401005055783735442,  # Vecchio server : canale feedback
+    1407462539289165884: 1407515405034979428   # Nuovo server : canale feedback
+}
+
+LOG_CHANNELS = {
+    1310417606607634432: 1401163197767221370,  # Vecchio server : canale log
+    1407462539289165884: 1407515405034979428   # Nuovo server : canale log (puoi cambiarlo se vuoi separare)
+}
+
 AUTHORIZED_ROLE = "Feedback"
 
 # ===== BOT SETUP =====
@@ -38,7 +46,6 @@ async def setupfeedback(ctx):
         await ctx.send("❌ Non hai i permessi per usare questo comando. Serve il ruolo **Feedback**.")
         return
 
-    # 🔍 Controlla se esiste già un messaggio con bottoni nel canale
     async for msg in ctx.channel.history(limit=20):
         if msg.author == bot.user and msg.components:
             await ctx.send("⚠️ Il bottone per il feedback è già stato inviato in questo canale.")
@@ -87,31 +94,42 @@ async def setupfeedback(ctx):
 @bot.event
 async def on_message(message):
     if isinstance(message.channel, discord.DMChannel) and not message.author.bot:
-        feedback_channel = bot.get_channel(FEEDBACK_CHANNEL_ID)
-        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+        # identifica il server (guild) in base al primo canale di log trovato
+        for guild in bot.guilds:
+            if guild.get_member(message.author.id):
+                guild_id = guild.id
+                break
+        else:
+            guild_id = None
 
-        if feedback_channel:
-            embed = discord.Embed(
-                title=f"📝 Feedback da {message.author.name}",
-                description=message.content if message.content else "*[Solo allegato senza testo]*",
-                color=0x00b0f4
-            )
-            embed.set_footer(text="Coaching Feedback Bot")
+        if guild_id:
+            feedback_channel_id = FEEDBACK_CHANNELS.get(guild_id)
+            log_channel_id = LOG_CHANNELS.get(guild_id)
 
-            files = [await attachment.to_file() for attachment in message.attachments]
-            await feedback_channel.send(embed=embed, files=files)
+            feedback_channel = bot.get_channel(feedback_channel_id) if feedback_channel_id else None
+            log_channel = bot.get_channel(log_channel_id) if log_channel_id else None
 
-            if log_channel:
-                log_msg = (
-                    f"📥 **Nuovo feedback ricevuto**\n"
-                    f"👤 Autore: {message.author} ({message.author.id})\n"
-                    f"📄 Testo:\n{message.content if message.content else '[Solo allegato]'}"
+            if feedback_channel:
+                embed = discord.Embed(
+                    title=f"📝 Feedback da {message.author.name}",
+                    description=message.content if message.content else "*[Solo allegato senza testo]*",
+                    color=0x00b0f4
                 )
-                await log_channel.send(log_msg)
+                embed.set_footer(text="Coaching Feedback Bot")
+
+                files = [await attachment.to_file() for attachment in message.attachments]
+                await feedback_channel.send(embed=embed, files=files)
+
+                if log_channel:
+                    log_msg = (
+                        f"📥 **Nuovo feedback ricevuto**\n"
+                        f"👤 Autore: {message.author} ({message.author.id})\n"
+                        f"📄 Testo:\n{message.content if message.content else '[Solo allegato]'}"
+                    )
+                    await log_channel.send(log_msg)
 
     await bot.process_commands(message)
 
 # ===== AVVIO BOT =====
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
-
