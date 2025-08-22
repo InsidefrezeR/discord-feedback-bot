@@ -46,8 +46,9 @@ async def setupfeedback(ctx):
         await ctx.send("❌ Non hai i permessi per usare questo comando. Serve il ruolo **Feedback**.")
         return
 
-    async for msg in ctx.channel.history(limit=20):
-        if msg.author == bot.user and msg.components:
+    # 🔍 Controlla in TUTTO lo storico del canale se c'è già un messaggio con componenti
+    async for msg in ctx.channel.history(limit=None):
+        if msg.author == bot.user and getattr(msg, "components", None):
             await ctx.send("⚠️ Il bottone per il feedback è già stato inviato in questo canale.")
             return
 
@@ -94,7 +95,7 @@ async def setupfeedback(ctx):
 @bot.event
 async def on_message(message):
     if isinstance(message.channel, discord.DMChannel) and not message.author.bot:
-        # identifica il server (guild) in base al primo canale di log trovato
+        # identifica il server (guild) in base al primo in cui si trova l'utente
         for guild in bot.guilds:
             if guild.get_member(message.author.id):
                 guild_id = guild.id
