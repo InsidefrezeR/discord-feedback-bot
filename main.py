@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Feedback Bot — Doppio anchor + bottone persistente + DM dedup + anti-doppio DM su click
+# Feedback Bot — Doppio anchor, bottone persistente, DM dedup, forward una sola volta (anche con più istanze)
 
 from flask import Flask
 from threading import Thread
@@ -8,44 +8,46 @@ import discord
 from discord.ext import commands
 from discord.ui import Button, View
 
-# ============ CONFIG ============
+# ============ CONFIG (ID forniti) ============
 SOURCE_GUILD_ID  = 1310417606607634432  # Vecchio server
 TARGET_GUILD_ID  = 1407462539289165884  # Nuovo server
 
+# Canali "anchor" (embed + bottone)
 BUTTON_CHANNEL_ID_OLD = 1401005055783735442  # canale (old) con embed+bottone
 BUTTON_CHANNEL_ID_NEW = 1407515405034979428  # canale (new) con embed+bottone
 
+# Canali di forward dai DM
 FORWARD_CHANNEL_ID_OLD = 1401005055783735442  # DM -> old
 FORWARD_CHANNEL_ID_NEW = 1407515405034979428  # DM -> new
 
+# Canali log
 LOG_CHANNEL_OLD = 1401163197767221370
 LOG_CHANNEL_NEW = 1407489479752552510
 
+# Ping ruolo (opzionale): metti un ID oppure None
 PING_ROLE_ID = None
-ANCHOR_MARK = "[FEEDBACK_ANCHOR]"
 
+# Marcatore messaggi anchor e store su disco
+ANCHOR_MARK = "[FEEDBACK_ANCHOR]"
 SEEN_STORE_PATH = "/mnt/data/dm_seen.json"
 ANCHORS_PATH    = "/mnt/data/anchors.json"
 
-PROCESSED_DM_IDS = set()
-ANCHORS = {}  # {channel_id:int -> message_id:str}
+# ============ Stato runtime ============
+PROCESSED_DM_IDS = set()          # dedup locale DM (message.id)
+ANCHORS = {}                      # {channel_id:int -> message_id:str}
+RECENT_INTERACTION_IDS = set()    # dedup per interaction.id (click bottone)
+LAST_DM_BY_USER = {}              # {user_id:int -> ts}
+USER_DM_COOLDOWN_SEC = 10.0       # evita doppi DM ravvicinati
+STARTED = False                   # guardia anti-doppio on_ready
 
-# Anti-doppio avvio
-STARTED = False
-
-# Anti-doppio DM sul click
-RECENT_INTERACTION_IDS = set()
-LAST_DM_BY_USER = {}  # {user_id:int -> epoch_ts:float}
-USER_DM_COOLDOWN_SEC = 10.0
-
-# ============ KEEP ALIVE ============
+# ============ KEEP ALIVE (Flask) ============
 app = Flask('')
 @app.route('/')
 def home(): return "Bot attivo!"
 def run(): app.run(host='0.0.0.0', port=8080)
 def keep_alive(): Thread(target=run, daemon=True).start()
 
-# ============ PERSISTENZA ============
+# ============ Persistenza su disco ============
 def load_seen():
     try:
         with open(SEEN_STORE_PATH, "r", encoding="utf-8") as f:
@@ -89,42 +91,43 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def get_text_channel(channel_id: int) -> discord.TextChannel | None:
     ch = bot.get_channel(channel_id)
     if ch is None:
-        try: ch = await bot.fetch_channel(channel_id)
-        except Exception: ch = None
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except Exception:
+            ch = None
     return ch if isinstance(ch, discord.TextChannel) else None
 
+# ---------- View con bottone (persistente) ----------
 class FeedbackView(View):
     def __init__(self): super().__init__(timeout=None)
 
     @discord.ui.button(label="📝 Lascia il tuo Feedback",
                        style=discord.ButtonStyle.primary,
-                       custom_id="feedback:open_dm")
+                       custom_id="feedback:open_dm")  # custom_id fisso = persistenza
     async def open_feedback(self, interaction: discord.Interaction, button: Button):
         now = time.time()
 
-        # 1) De-dup per interaction.id
+        # De-dup per interaction.id (evita doppio callback)
         iid = getattr(interaction, "id", None)
         if iid and iid in RECENT_INTERACTION_IDS:
-            # Già gestita: ignora silenziosamente
             return
         if iid:
             RECENT_INTERACTION_IDS.add(iid)
 
-        # 2) Cooldown per utente (evita doppi DM anche se il callback scatta due volte)
+        # Cooldown per utente (evita 2 DM ravvicinati se il callback parte due volte)
         uid = interaction.user.id
-        last = LAST_DM_BY_USER.get(uid, 0)
+        last = LAST_DM_BY_USER.get(uid, 0.0)
         if now - last < USER_DM_COOLDOWN_SEC:
-            # Avvisa solo in ephemeral, niente secondo DM
             try:
                 await interaction.response.send_message(
-                    "✅ Ti ho già inviato il modulo in DM tra pochissimi secondi. Controlla i messaggi privati.",
+                    "✅ Ti ho già inviato il modulo in DM. Controlla i messaggi privati.",
                     ephemeral=True
                 )
             except Exception:
                 pass
             return
 
-        # 3) Invia UN SOLO DM
+        # Invia UN SOLO DM
         try:
             await interaction.user.send(
                 "**📋 Compila il feedback coaching rispondendo a queste domande in UN SOLO messaggio:**\n\n"
@@ -143,10 +146,8 @@ class FeedbackView(View):
                 "🔁 *Invia tutto in un unico messaggio. Poi allega immagini/clip subito dopo.*"
             )
             LAST_DM_BY_USER[uid] = now
-            # Risposta ephemeral per dare conferma nell’interfaccia
             await interaction.response.send_message("📨 Ti ho mandato il modulo in DM!", ephemeral=True)
         except discord.Forbidden:
-            # DM bloccati: nessun DM, solo info ephemeral
             try:
                 await interaction.response.send_message(
                     "❌ Non riesco a scriverti in DM. Attiva i messaggi privati e riprova.",
@@ -155,8 +156,8 @@ class FeedbackView(View):
             except Exception:
                 pass
 
+# ---------- Anchor finder/creator (idempotente, anti-doppioni) ----------
 async def find_existing_anchor(channel: discord.TextChannel):
-    """Trova/normalizza l'unico anchor del bot in questo canale."""
     cid = channel.id
     msg_id = ANCHORS.get(cid)
     if msg_id:
@@ -206,7 +207,6 @@ async def ensure_anchor_in_channel(channel_id: int):
         return
 
     existing = await find_existing_anchor(channel)
-
     embed = discord.Embed(
         title="🎯 Feedback Coaching",
         description="Clicca il pulsante qui sotto per aprire il modulo in DM e inviare il tuo feedback.",
@@ -215,15 +215,19 @@ async def ensure_anchor_in_channel(channel_id: int):
 
     try:
         if existing:
-            await existing.edit(content=f"{ANCHOR_MARK} Non rimuovere questo messaggio (anchor).",
-                                embed=embed, view=FeedbackView())
+            await existing.edit(
+                content=f"{ANCHOR_MARK} Non rimuovere questo messaggio (anchor).",
+                embed=embed, view=FeedbackView()
+            )
             try: await existing.pin()
             except Exception: pass
             ANCHORS[channel.id] = str(existing.id); save_anchors()
             print(f"[ANCHOR] Ri-usato anchor in #{getattr(channel,'name',channel.id)}")
         else:
-            msg = await channel.send(f"{ANCHOR_MARK} Non rimuovere questo messaggio (anchor).",
-                                     embed=embed, view=FeedbackView())
+            msg = await channel.send(
+                f"{ANCHOR_MARK} Non rimuovere questo messaggio (anchor).",
+                embed=embed, view=FeedbackView()
+            )
             try: await msg.pin()
             except Exception: pass
             ANCHORS[channel.id] = str(msg.id); save_anchors()
@@ -231,6 +235,60 @@ async def ensure_anchor_in_channel(channel_id: int):
     except Exception as e:
         print(f"[ANCHOR] Update/create error in {channel_id}: {e}")
 
+# ---------- Forward UNA SOLA VOLTA per canale (anche con più istanze) ----------
+async def send_feedback_once(channel_id: int, embed: discord.Embed, files, dm_id: int, ping_role_id: int | None):
+    ch = await get_text_channel(channel_id)
+    if not ch:
+        print(f"[FORWARD] Canale {channel_id} non disponibile.")
+        return
+
+    marker = f"[DM_ID:{dm_id}]"
+
+    # 1) Controllo history: se già presente un messaggio con quel DM_ID, non reinvia
+    try:
+        async for m in ch.history(limit=40):
+            if m.author == bot.user:
+                content_ok = (marker in (m.content or ""))
+                footer_ok = False
+                try:
+                    if m.embeds:
+                        foot = m.embeds[0].footer.text or ""
+                        if marker in foot:
+                            footer_ok = True
+                except Exception:
+                    pass
+                if content_ok or footer_ok:
+                    return  # già inviato (da questa o un'altra istanza)
+    except Exception as e:
+        print(f"[FORWARD] History check fallito in {channel_id}: {e}")
+
+    # 2) Prepara content (con ping opzionale) + marker
+    if ping_role_id:
+        content = f"<@&{ping_role_id}>\n{marker}"
+    else:
+        content = marker
+
+    # 3) Appendi marker anche nel footer dell'embed
+    try:
+        footer_txt = (embed.footer.text or "")
+    except Exception:
+        footer_txt = ""
+    embed.set_footer(text=(footer_txt + (" " if footer_txt else "") + marker))
+
+    # 4) Invia
+    try:
+        await ch.send(
+            content=content,
+            embed=embed,
+            files=files,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except discord.Forbidden:
+        print(f"[FORWARD] Permesso negato nel canale {channel_id}.")
+    except Exception as e:
+        print(f"[FORWARD] Errore invio in {channel_id}: {e}")
+
+# ---------- Eventi ----------
 @bot.event
 async def on_ready():
     global STARTED
@@ -243,10 +301,10 @@ async def on_ready():
     load_seen()
     load_anchors()
 
-    # Registra UNA SOLA volta la View persistente
+    # Registra view persistente UNA SOLA volta
     bot.add_view(FeedbackView())
 
-    # Assicura anchor in entrambi i canali
+    # Anchor in entrambi i canali
     await ensure_anchor_in_channel(BUTTON_CHANNEL_ID_OLD)
     await ensure_anchor_in_channel(BUTTON_CHANNEL_ID_NEW)
 
@@ -260,6 +318,7 @@ async def on_message(message: discord.Message):
         PROCESSED_DM_IDS.add(mid)
         save_seen()
 
+        # Prepara embed + files
         embed = discord.Embed(
             title=f"📝 Feedback da {message.author.name}",
             description=message.content if message.content else "*[Solo allegato senza testo]*",
@@ -274,30 +333,23 @@ async def on_message(message: discord.Message):
         except Exception as e:
             print(f"[FILES] Errore conversione allegati: {e}")
 
-        content_prefix = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else None
+        # Inoltra UNA SOLA VOLTA nei due canali (anche con più istanze)
+        dm_id_int = int(message.id)
+        await send_feedback_once(FORWARD_CHANNEL_ID_OLD, embed, files, dm_id_int, PING_ROLE_ID)
+        await send_feedback_once(FORWARD_CHANNEL_ID_NEW, embed, files, dm_id_int, PING_ROLE_ID)
 
-        for ch_id in (FORWARD_CHANNEL_ID_OLD, FORWARD_CHANNEL_ID_NEW):
-            ch = await get_text_channel(ch_id)
-            if not ch:
-                print(f"[FORWARD] Canale {ch_id} non disponibile.")
-                continue
-            try:
-                await ch.send(content=content_prefix, embed=embed, files=files)
-            except discord.Forbidden:
-                print(f"[FORWARD] Permesso negato nel canale {ch_id}.")
-            except Exception as e:
-                print(f"[FORWARD] Errore invio in {ch_id}: {e}")
-
+        # Log (puoi aggiungere marker anche qui se vuoi evitare doppi log multi-istanza)
         for log_id in (LOG_CHANNEL_OLD, LOG_CHANNEL_NEW):
-            log_ch = await get_text_channel(log_id)
-            if not log_ch:
+            ch = await get_text_channel(log_id)
+            if not ch:
                 continue
             try:
-                await log_ch.send(
-                    f"📥 **Nuovo feedback ricevuto in DM**\n"
+                await ch.send(
+                    f"📥 **Nuovo feedback DM** (ID {message.id})\n"
                     f"👤 Autore: {message.author} (`{message.author.id}`)\n"
                     f"🧾 Caratteri: {len(message.content or '')}\n"
-                    f"📎 Allegati: {len(message.attachments)}"
+                    f"📎 Allegati: {len(message.attachments)}",
+                    allowed_mentions=discord.AllowedMentions.none()
                 )
             except Exception as e:
                 print(f"[LOG] Errore invio log in {log_id}: {e}")
@@ -307,12 +359,12 @@ async def on_message(message: discord.Message):
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
     if isinstance(after.channel, discord.DMChannel):
-        return  # ignora edit dei DM
+        return  # ignora edit DM (niente reinvii)
 
 # ============ AVVIO ============
 if __name__ == "__main__":
-    keep_alive()
+    keep_alive()  # utile su Render/Replit
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        raise RuntimeError("DISCORD_TOKEN non impostato.")
+        raise RuntimeError("DISCORD_TOKEN non impostato nelle variabili d'ambiente.")
     bot.run(token)
