@@ -1,30 +1,39 @@
 # -*- coding: utf-8 -*-
-# Feedback Bot — Auto anchor + Persistent Button + DM forward a VECCHIO e NUOVO server
-# Requisiti: python 3.10+, pip install -U discord.py Flask python-dotenv (opzionale)
+# Feedback Bot — Doppio anchor (vecchio+nuovo), bottone persistente, DM de-duplicati, forward su due canali
+# Requisiti: python 3.10+, pip install -U discord.py Flask python-dotenv
 
 from flask import Flask
 from threading import Thread
-import os
+import os, json, asyncio
 import discord
 from discord.ext import commands
 from discord.ui import Button, View
 
 # ============ CONFIG FISSA ============
-SOURCE_GUILD_ID  = 1310417606607634432  # Vecchio server (dove compare il bottone)
-TARGET_GUILD_ID  = 1407462539289165884  # Nuovo server (dove arrivano i feedback)
+SOURCE_GUILD_ID  = 1310417606607634432  # Vecchio server
+TARGET_GUILD_ID  = 1407462539289165884  # Nuovo server
 
-BUTTON_CHANNEL_ID        = 1401005055783735442  # canale nel vecchio server per embed + bottone
-FORWARD_CHANNEL_ID_OLD   = 1401005055783735442  # (vecchio server) dove inoltrare i DM
-FORWARD_CHANNEL_ID_NEW   = 1407515405034979428  # (nuovo server) dove inoltrare i DM
+# Canali "anchor" (embed + bottone)
+BUTTON_CHANNEL_ID_OLD = 1401005055783735442
+BUTTON_CHANNEL_ID_NEW = 1407515405034979428  # se vuoi un canale diverso nel nuovo server, metti l'ID qui
 
-LOG_CHANNEL_OLD = 1401163197767221370          # log nel vecchio server
-LOG_CHANNEL_NEW = 1407489479752552510          # log nel nuovo server
+# Canali di forward dai DM
+FORWARD_CHANNEL_ID_OLD = 1401005055783735442
+FORWARD_CHANNEL_ID_NEW = 1407515405034979428
 
-# (Opzionale) ping ruolo quando arriva un feedback: metti un ID o lascia None
-PING_ROLE_ID = None  # es. 123456789012345678 oppure None per disattivare
+# Canali log
+LOG_CHANNEL_OLD = 1401163197767221370
+LOG_CHANNEL_NEW = 1407489479752552510
 
-# Messaggio marcatore per riconoscere/aggiornare l’anchor ai riavvii
+# Ping ruolo (opzionale): metti un ID oppure None
+PING_ROLE_ID = None
+
+# Marcatore per ancorare il messaggio
 ANCHOR_MARK = "[FEEDBACK_ANCHOR]"
+
+# Persistenza dedup DM
+SEEN_STORE_PATH = "/mnt/data/dm_seen.json"
+PROCESSED_DM_IDS = set()
 
 # ============ KEEP ALIVE (Flask) ============
 app = Flask('')
@@ -39,6 +48,26 @@ def run():
 def keep_alive():
     t = Thread(target=run, daemon=True)
     t.start()
+
+# ============ UTILS DEDUP ============
+def load_seen():
+    try:
+        with open(SEEN_STORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                PROCESSED_DM_IDS.update(data[-5000:])  # limita dimensione
+    except Exception:
+        pass
+
+def save_seen():
+    try:
+        os.makedirs(os.path.dirname(SEEN_STORE_PATH), exist_ok=True)
+        # salva solo ultimi 5000
+        arr = list(PROCESSED_DM_IDS)[-5000:]
+        with open(SEEN_STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(arr, f)
+    except Exception as e:
+        print(f"[SEEN] Save error: {e}")
 
 # ============ DISCORD BOT ============
 intents = discord.Intents.all()
@@ -57,13 +86,12 @@ async def get_text_channel(channel_id: int) -> discord.TextChannel | None:
 # ---- Persistent View (bottone) ----
 class FeedbackView(View):
     def __init__(self):
-        # timeout=None => persistenza dopo i restart
-        super().__init__(timeout=None)
+        super().__init__(timeout=None)  # Persistente ai riavvii
 
     @discord.ui.button(
         label="📝 Lascia il tuo Feedback",
         style=discord.ButtonStyle.primary,
-        custom_id="feedback:open_dm"  # custom_id fisso richiesto per la persistenza
+        custom_id="feedback:open_dm"  # custom_id fisso per persistenza
     )
     async def open_feedback(self, interaction: discord.Interaction, button: Button):
         # Invio istruzioni in DM; se fallisce (DM off), avvisa in ephemeral
@@ -101,54 +129,71 @@ class FeedbackView(View):
                 ephemeral=True
             )
 
-# ---- Pubblica o aggiorna l'anchor (embed + bottone) nel vecchio server ----
-async def ensure_anchor_message():
-    channel = await get_text_channel(BUTTON_CHANNEL_ID)
+# ---- Anchor: crea/ri-usa (no duplicati) e ri-attacca la View ----
+async def ensure_anchor_in_channel(channel_id: int):
+    channel = await get_text_channel(channel_id)
     if channel is None:
-        print(f"[ANCHOR] Canale {BUTTON_CHANNEL_ID} non trovato o non testuale.")
+        print(f"[ANCHOR] Canale {channel_id} non trovato o non testuale.")
         return
 
-    # 1) Pulisce vecchi anchor del bot (se ha permesso Manage Messages è più pulito)
+    existing = None
     try:
         async for msg in channel.history(limit=50):
             if msg.author == bot.user and (msg.content or "").startswith(ANCHOR_MARK):
-                try:
-                    await msg.delete()
-                except Exception as e:
-                    print(f"[ANCHOR] Impossibile cancellare anchor precedente: {e}")
+                existing = msg
+                break
     except Exception as e:
-        print(f"[ANCHOR] Lettura history fallita: {e}")
+        print(f"[ANCHOR] Lettura history fallita su {channel_id}: {e}")
 
-    # 2) Invia nuovo embed + bottone e prova a pinnare
     embed = discord.Embed(
         title="🎯 Feedback Coaching",
         description="Clicca il pulsante qui sotto per aprire il modulo in DM e inviare il tuo feedback.",
         color=0x00B0F4
     )
+
     try:
-        msg = await channel.send(f"{ANCHOR_MARK} Non rimuovere questo messaggio (anchor).", embed=embed, view=FeedbackView())
-        try:
-            await msg.pin()
-        except Exception:
-            pass
-        print(f"[ANCHOR] Pubblicato anchor in #{channel.name}")
+        if existing:
+            # Ri-attacca la view (rebind bottone) e aggiorna embed
+            await existing.edit(content=existing.content, embed=embed, view=FeedbackView())
+            try:
+                await existing.pin()
+            except Exception:
+                pass
+            print(f"[ANCHOR] Ri-usato anchor in #{getattr(channel, 'name', channel_id)}")
+        else:
+            # Crea nuovo anchor
+            msg = await channel.send(f"{ANCHOR_MARK} Non rimuovere questo messaggio (anchor).", embed=embed, view=FeedbackView())
+            try:
+                await msg.pin()
+            except Exception:
+                pass
+            print(f"[ANCHOR] Creato anchor in #{getattr(channel, 'name', channel_id)}")
     except Exception as e:
-        print(f"[ANCHOR] Invio anchor fallito: {e}")
+        print(f"[ANCHOR] Errore update/creazione in {channel_id}: {e}")
 
 # ---- Ready ----
 @bot.event
 async def on_ready():
     print(f"✅ Bot online come {bot.user} (id: {bot.user.id})")
-    # Registra la View persistente per mantenere attivi i bottoni su messaggi già esistenti
+    load_seen()  # carica cache dedup da disco
+    # Registra la View persistente per messaggi già presenti
     bot.add_view(FeedbackView())
-    # Auto-setup dell’anchor nel vecchio server
-    await ensure_anchor_message()
+    # Assicura anchor in ENTRAMBI i canali (vecchio + nuovo)
+    await ensure_anchor_in_channel(BUTTON_CHANNEL_ID_OLD)
+    await ensure_anchor_in_channel(BUTTON_CHANNEL_ID_NEW)
 
-# ---- DM handler: inoltra SEMPRE a DUE canali (vecchio + nuovo) ----
+# ---- DM handler: de-dup + forward su due canali ----
 @bot.event
 async def on_message(message: discord.Message):
-    # Gestione DM dell’utente (no bot)
+    # DM utente (non bot)
     if isinstance(message.channel, discord.DMChannel) and not message.author.bot:
+        # De-dup per message.id
+        mid = str(message.id)
+        if mid in PROCESSED_DM_IDS:
+            return
+        PROCESSED_DM_IDS.add(mid)
+        save_seen()
+
         # Prepara embed + files
         embed = discord.Embed(
             title=f"📝 Feedback da {message.author.name}",
@@ -164,10 +209,9 @@ async def on_message(message: discord.Message):
         except Exception as e:
             print(f"[FILES] Errore conversione allegati: {e}")
 
-        # Eventuale ping ruolo
-        content_prefix = f"<@&{PING_ROLE_ID}>\n" if PING_ROLE_ID else None
+        content_prefix = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else None
 
-        # Inoltra nei due canali target (vecchio + nuovo)
+        # Inoltra nei due canali target (vecchio + nuovo) UNA SOLA VOLTA
         for ch_id in (FORWARD_CHANNEL_ID_OLD, FORWARD_CHANNEL_ID_NEW):
             ch = await get_text_channel(ch_id)
             if not ch:
@@ -180,7 +224,7 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 print(f"[FORWARD] Errore invio in {ch_id}: {e}")
 
-        # Log (vecchio e/o nuovo server)
+        # Log (vecchio e nuovo server)
         for log_id in (LOG_CHANNEL_OLD, LOG_CHANNEL_NEW):
             log_ch = await get_text_channel(log_id)
             if not log_ch:
@@ -196,8 +240,13 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 print(f"[LOG] Errore invio log in {log_id}: {e}")
 
-    # Non bloccare altri comandi/listeners
     await bot.process_commands(message)
+
+# (Facoltativo) ignora edit dei DM per sicurezza
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if isinstance(after.channel, discord.DMChannel):
+        return  # non re-inoltrare edit dei DM
 
 # ============ AVVIO ============
 if __name__ == "__main__":
